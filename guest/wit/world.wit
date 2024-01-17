@@ -1,0 +1,35 @@
+package component:guest;
+
+// interface original-interface {
+//   foo: func(s: string) -> string;
+// }
+
+// world original-world {
+//   import original-interface;
+//   export original-interface;
+// }
+
+interface isyswasfa {
+  resource pending;
+  resource cancel;
+  resource ready;
+
+  new: func() -> tuple<pending, cancel, ready>;
+}
+
+interface original-interface-async {
+  use isyswasfa.{pending, ready};
+
+  variant foo-future {
+    ready(string),
+    pending(pending),
+  }
+
+  foo: func(s: string) -> foo-future;
+  foo-result: func(ready: ready) -> string;
+}
+
+world original-world-async {
+  import original-interface-async;
+  export original-interface-async;
+}
