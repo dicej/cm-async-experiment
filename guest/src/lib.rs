@@ -1,17 +1,42 @@
+#![allow(clippy::module_inception)]
+
 cargo_component_bindings::generate!();
 
 use {
+    async_trait::async_trait,
     bindings::{
-        component::guest::original_interface_async,
-        exports::component::guest::original_interface_async::{FooFuture, Guest, Ready},
-        exports::isyswasfa::guest::shared::Guest as IsyswasfaGuest,
-        isyswasfa::guest::shared::{self, PollOutput, PollOutputPending},
+        exports::component::guest::{
+            isyswasfa::Guest as Isyswasfa,
+            original_interface_async::Guest as OriginalInterfaceAsync,
+        },
+        isyswasfa::isyswasfa::isyswasfa::{Pending, PollInput, PollOutput, Ready},
     },
-    std::task::{Wake, Waker},
 };
 
 // library crate
 mod isyswasfa_guest {
+    use {
+        super::bindings::isyswasfa::isyswasfa::isyswasfa::{
+            self, Cancel, Pending, PollInput, PollInputCancel, PollInputListening, PollInputReady,
+            PollOutput, PollOutputListen, PollOutputPending, PollOutputReady, Ready,
+        },
+        by_address::ByAddress,
+        futures::{channel::oneshot, future::FutureExt},
+        once_cell::sync::Lazy,
+        std::{
+            any::Any,
+            cell::RefCell,
+            collections::HashMap,
+            future::Future,
+            mem,
+            ops::{Deref, DerefMut},
+            pin::Pin,
+            rc::Rc,
+            sync::Arc,
+            task::{Context, Poll, Wake, Waker},
+        },
+    };
+
     fn dummy_waker() -> Waker {
         struct DummyWaker;
 
@@ -24,17 +49,19 @@ mod isyswasfa_guest {
         WAKER.clone().into()
     }
 
+    type BoxFuture = Pin<Box<dyn Future<Output = Box<dyn Any>> + 'static>>;
+
     enum CancelState {
         Pending,
         Cancel,
-        Listening,
+        Listening(Cancel),
     }
 
     struct CancelOnDrop(Rc<RefCell<CancelState>>);
 
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
-            match mem::replace(self.0.borrow_mut(), CancelState::Cancel) {
+            match mem::replace(self.0.borrow_mut().deref_mut(), CancelState::Cancel) {
                 CancelState::Pending | CancelState::Cancel => {}
                 CancelState::Listening(cancel) => push(PollOutput::Cancel(cancel)),
             }
@@ -48,6 +75,12 @@ mod isyswasfa_guest {
     }
 
     static mut PENDING: Vec<PendingState> = Vec::new();
+
+    static mut POLL_OUTPUT: Vec<PollOutput> = Vec::new();
+
+    fn push(output: PollOutput) {
+        unsafe { POLL_OUTPUT.push(output) }
+    }
 
     fn add_pending(pending_state: PendingState) {
         unsafe { PENDING.push(pending_state) }
@@ -71,12 +104,12 @@ mod isyswasfa_guest {
 
     enum FutureState {
         Pending {
-            ready: Ready,
-            future: BoxFuture<'static, Box<dyn Any + Send + Sync>>,
+            ready: Option<Ready>,
+            future: BoxFuture,
             cancel_states: Vec<Rc<RefCell<CancelState>>>,
         },
         Cancelled(Option<Cancel>),
-        Ready(Option<Box<dyn Any + Send + Sync>>),
+        Ready(Option<Box<dyn Any>>),
     }
 
     impl Drop for FutureState {
@@ -84,12 +117,12 @@ mod isyswasfa_guest {
             match self {
                 Self::Pending { .. } => unreachable!(),
                 Self::Cancelled(cancel) => push(PollOutput::CancelComplete(cancel.take().unwrap())),
-                Self::Ready(None) => assert!(ready.is_none()),
+                Self::Ready(ready) => assert!(ready.is_none()),
             }
         }
     }
 
-    fn push_listens(future_state: Rc<RefCell<FutureState>>) {
+    fn push_listens(future_state: &Rc<RefCell<FutureState>>) {
         for pending in take_pending() {
             push(PollOutput::Listen(PollOutputListen {
                 pending: pending.pending,
@@ -103,19 +136,24 @@ mod isyswasfa_guest {
         }
     }
 
-    fn first_poll<T>(future: impl Future<Output = T>) -> Result<T, Pending> {
-        match future.poll(&mut Context::from_waker(&dummy_waker())) {
+    pub fn first_poll<T: 'static>(future: impl Future<Output = T> + 'static) -> Result<T, Pending> {
+        let mut future = Box::pin(future.map(|v| Box::new(v) as Box<dyn Any>)) as BoxFuture;
+
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(&dummy_waker()))
+        {
             Poll::Pending => {
                 let (pending, cancel, ready) = isyswasfa::new();
                 let future_state = Rc::new(RefCell::new(FutureState::Pending {
-                    ready,
+                    ready: Some(ready),
                     future,
-                    cancels: Vec::new(),
+                    cancel_states: Vec::new(),
                 }));
 
-                push_listens(future_state);
+                push_listens(&future_state);
 
-                isyswasfa_guest::push(PollOutput::Pending(PollOutputPending {
+                push(PollOutput::Pending(PollOutputPending {
                     cancel,
                     state: u32::try_from(Rc::into_raw(future_state) as usize).unwrap(),
                 }));
@@ -123,14 +161,14 @@ mod isyswasfa_guest {
                 Err(pending)
             }
             Poll::Ready(result) => {
-                isyswasfa_guest::clear_pending();
-                Ok(result)
+                clear_pending();
+                Ok(*result.downcast().unwrap())
             }
         }
     }
 
-    fn get_ready<T>(ready: Ready) -> T {
-        match unsafe { Rc::from_raw(ready.state() as usize as *const FutureState) }
+    pub fn get_ready<T: 'static>(ready: Ready) -> T {
+        match unsafe { Rc::from_raw(ready.state() as usize as *const RefCell<FutureState>) }
             .borrow_mut()
             .deref_mut()
         {
@@ -139,23 +177,25 @@ mod isyswasfa_guest {
         }
     }
 
-    fn cancel_all(cancels: Vec<Rc<RefCell<CancelState>>>) {
+    fn cancel_all(cancels: &[Rc<RefCell<CancelState>>]) {
         for cancel in cancels {
-            match mem::replace(cancel.borrow_mut(), CancelState::Cancel) {
+            match mem::replace(cancel.borrow_mut().deref_mut(), CancelState::Cancel) {
                 CancelState::Pending | CancelState::Cancel => {}
                 CancelState::Listening(cancel) => push(PollOutput::Cancel(cancel)),
             }
         }
     }
 
-    fn poll(input: Vec<PollInput>) -> Vec<PollOutput> {
+    pub fn poll(input: Vec<PollInput>) -> Vec<PollOutput> {
+        let mut pollables = HashMap::new();
+
         for input in input {
             match input {
                 PollInput::Listening(PollInputListening { state, cancel }) => {
                     let listen_state =
                         unsafe { (state as usize as *const ListenState).as_ref().unwrap() };
 
-                    let listening = match listen_state.cancel_state.borrow() {
+                    let listening = match listen_state.cancel_state.borrow().deref() {
                         CancelState::Pending => true,
                         CancelState::Cancel => false,
                         CancelState::Listening(_) => unreachable!(),
@@ -163,79 +203,88 @@ mod isyswasfa_guest {
 
                     if listening {
                         match listen_state.future_state.borrow_mut().deref_mut() {
-                            FutureState::Pending { cancels, .. } => {
+                            FutureState::Pending { cancel_states, .. } => {
                                 cancel_states.push(listen_state.cancel_state.clone())
                             }
                             _ => unreachable!(),
                         }
 
-                        listen_state.cancel_state.borrow_mut() = CancelState::Listening(cancel)
+                        *listen_state.cancel_state.borrow_mut() = CancelState::Listening(cancel)
                     } else {
                         push(PollOutput::Cancel(cancel));
                     }
                 }
                 PollInput::Ready(PollInputReady { state, ready }) => {
                     let listen_state =
-                        *unsafe { Box::from_raw(state as usize as *const ListenState) };
+                        *unsafe { Box::from_raw(state as usize as *mut ListenState) };
 
-                    listen_state.cancel_state.borrow_mut() = CancelState::Cancel;
+                    match mem::replace(
+                        listen_state.cancel_state.borrow_mut().deref_mut(),
+                        CancelState::Cancel,
+                    ) {
+                        CancelState::Pending | CancelState::Listening(_) => {
+                            drop(listen_state.tx.send(ready))
+                        }
+                        CancelState::Cancel => {}
+                    }
 
-                    _ = listen_state.tx.send(ready);
-
-                    pollables.insert(ByAddress(listen_state.future_state.clone()), state);
+                    pollables.insert(
+                        ByAddress(listen_state.future_state.clone()),
+                        listen_state.future_state,
+                    );
                 }
                 PollInput::Cancel(PollInputCancel { state, cancel }) => {
                     let future_state =
-                        unsafe { Rc::from_raw(state as usize as *const FutureState) };
+                        unsafe { Rc::from_raw(state as usize as *const RefCell<FutureState>) };
 
-                    let old = mem::replace(
+                    let mut old = mem::replace(
                         future_state.borrow_mut().deref_mut(),
                         FutureState::Cancelled(Some(cancel)),
                     );
 
-                    match old {
+                    match &mut old {
                         FutureState::Pending { cancel_states, .. } => cancel_all(cancel_states),
                         FutureState::Cancelled(_) => unreachable!(),
-                        FutureState::Ready(ready) => ready.take(),
+                        FutureState::Ready(ready) => drop(ready.take()),
                     }
                 }
                 PollInput::CancelComplete(state) => unsafe {
-                    drop(Box::from_raw(state as usize as *const ListenState))
+                    drop(Box::from_raw(state as usize as *mut ListenState))
                 },
             }
         }
 
         for future_state in pollables.into_values() {
             let poll = match future_state.borrow_mut().deref_mut() {
-                Future::Pending { future, .. } => {
-                    future.poll(&mut Context::from_waker(&dummy_waker()))
-                }
+                FutureState::Pending { future, .. } => future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&dummy_waker())),
                 _ => continue,
             };
 
             match poll {
-                Poll::Pending => push_listens(future_state),
+                Poll::Pending => push_listens(&future_state),
                 Poll::Ready(result) => {
                     clear_pending();
 
-                    let old = mem::replace(
+                    let mut old = mem::replace(
                         future_state.borrow_mut().deref_mut(),
                         FutureState::Ready(Some(Box::new(result))),
                     );
 
-                    let Future::Pending {
+                    let FutureState::Pending {
                         ready,
                         cancel_states,
                         ..
-                    } = old
+                    } = &mut old
                     else {
                         unreachable!()
                     };
 
                     cancel_all(cancel_states);
 
-                    push(PollOutput::Ready(PollOutputListen {
-                        ready,
+                    push(PollOutput::Ready(PollOutputReady {
+                        ready: ready.take().unwrap(),
                         state: u32::try_from(Rc::into_raw(future_state) as usize).unwrap(),
                     }));
                 }
@@ -244,22 +293,30 @@ mod isyswasfa_guest {
 
         unsafe { mem::take(&mut POLL_OUTPUT) }
     }
+
+    pub async fn await_ready(pending: Pending) -> Ready {
+        let (tx, rx) = oneshot::channel();
+        let cancel_state = Rc::new(RefCell::new(CancelState::Pending));
+        add_pending(PendingState {
+            pending,
+            tx,
+            cancel_state: cancel_state.clone(),
+        });
+        let _cancel_on_drop = CancelOnDrop(cancel_state);
+        rx.await.unwrap()
+    }
 }
 
 // generated
 mod original_interface_async_async {
-    async fn foo(s: String) -> String {
+    use super::{bindings::component::guest::original_interface_async, isyswasfa_guest};
+
+    pub async fn foo(s: &str) -> String {
         match original_interface_async::foo(s) {
-            FooFuture::Pending(pending) => {
-                let (tx, rx) = oneshot::channel();
-                let cancel_state = Rc::new(RefCell::new(CancelState::Pending));
-                isyswasfa_guest::add_pending(pending, tx, cancel_state.clone());
-                original_interface_async::foo_result({
-                    let cancel_on_drop = CancelOnDrop(cancel_state);
-                    rx.await.unwrap()
-                });
+            Ok(result) => result,
+            Err(pending) => {
+                original_interface_async::foo_result(isyswasfa_guest::await_ready(pending).await)
             }
-            FooFuture::Ready(result) => result,
         }
     }
 }
@@ -268,14 +325,14 @@ mod original_interface_async_async {
 struct Component;
 
 // generated
-impl IsyswasfaGuest for Component {
+impl Isyswasfa for Component {
     fn poll_abc123(input: Vec<PollInput>) -> Vec<PollOutput> {
         isyswasfa_guest::poll(input)
     }
 }
 
 // generated
-impl Guest for Component {
+impl OriginalInterfaceAsync for Component {
     fn foo(s: String) -> Result<String, Pending> {
         isyswasfa_guest::first_poll(<ComponentAsync as GuestAsync>::foo(s))
     }
@@ -286,7 +343,7 @@ impl Guest for Component {
 }
 
 // generated
-#[async_trait]
+#[async_trait(?Send)]
 trait GuestAsync {
     async fn foo(s: String) -> String;
 }
@@ -295,9 +352,9 @@ trait GuestAsync {
 struct ComponentAsync;
 
 // written by app dev
-#[async_trait]
+#[async_trait(?Send)]
 impl GuestAsync for ComponentAsync {
     async fn foo(s: String) -> String {
-        original_interface_async_async::foo(s).await
+        original_interface_async_async::foo(&s).await
     }
 }

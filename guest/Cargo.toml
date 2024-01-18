@@ -6,7 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait = "0.1.77"
+by_address = "1.1.0"
 cargo-component-bindings = "0.6.0"
+futures = "0.3.30"
+once_cell = "1.19.0"
 
 [lib]
 crate-type = ["cdylib"]
@@ -14,4 +18,5 @@ crate-type = ["cdylib"]
 [package.metadata.component]
 package = "component:guest"
 
-[package.metadata.component.dependencies]
+[package.metadata.component.target.dependencies]
+"isyswasfa:isyswasfa" = { path = "wit/deps/isyswasfa" }
