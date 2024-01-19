@@ -54,5 +54,5 @@ interface isyswasfa {
     cancel-complete(cancel)
   }
 
-  new: func() -> tuple<pending, cancel, ready>;
+  make-task: func() -> tuple<pending, cancel, ready>;
 }

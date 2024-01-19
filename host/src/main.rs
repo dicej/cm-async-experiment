@@ -18,9 +18,9 @@ wasmtime::component::bindgen!({
         only_imports: []
     },
     with: {
-        "isyswasfa:isyswasfa/isyswasfa/ready": MyReady,
-        "isyswasfa:isyswasfa/isyswasfa/pending": MyPending,
-        "isyswasfa:isyswasfa/isyswasfa/cancel": MyCancel,
+        "isyswasfa:isyswasfa/isyswasfa/ready": isyswasfa_host::Task,
+        "isyswasfa:isyswasfa/isyswasfa/pending": isyswasfa_host::Task,
+        "isyswasfa:isyswasfa/isyswasfa/cancel": isyswasfa_host::Task,
     }
 });
 
@@ -73,10 +73,14 @@ mod isyswasfa_bindings {
                         s: String,
                     ) -> wasmtime::Result<Result<String, Resource<Pending>>> {
                         let future = <T as Host>::foo(self.state(), s);
-                        self.isyswasfa_mut().first_poll(future)
+                        Ok(match self.isyswasfa_mut().first_poll(future)? {
+                            Ok(v) => Ok(v),
+                            Err(pending) => Err(self.table_mut().push(pending)?),
+                        })
                     }
 
                     fn foo_result(&mut self, ready: Resource<Ready>) -> wasmtime::Result<String> {
+                        let ready = self.table().get(&ready)?.clone();
                         self.isyswasfa_mut().get_ready(ready)
                     }
                 }
@@ -108,12 +112,11 @@ mod isyswasfa_bindings {
                             match self.0.call_foo(&mut store, arg0).await? {
                                 Ok(result) => Ok(result),
                                 Err(pending) => {
-                                    let ready = store
-                                        .as_context_mut()
-                                        .data_mut()
-                                        .isyswasfa_mut()
-                                        .await_ready(pending)
-                                        .await;
+                                    let mut context = store.as_context_mut();
+                                    let data = context.data_mut();
+                                    let pending = data.table().get(&pending)?.clone();
+                                    let ready = data.isyswasfa_mut().await_ready(pending).await;
+                                    let ready = data.table_mut().push(ready)?;
 
                                     self.0.call_foo_result(store, ready).await
                                 }
@@ -128,26 +131,73 @@ mod isyswasfa_bindings {
 
 mod isyswasfa_host {
     use {
-        super::isyswasfa::isyswasfa::isyswasfa::{Pending, Ready},
-        std::future::Future,
-        wasmtime::component::Resource,
+        futures::future::FutureExt,
+        once_cell::sync::Lazy,
+        std::{
+            any::Any,
+            future::Future,
+            pin::Pin,
+            sync::{Arc, Mutex},
+            task::{Context, Poll, Wake, Waker},
+        },
+        wasmtime_wasi::preview2::Table,
     };
+
+    fn dummy_waker() -> Waker {
+        struct DummyWaker;
+
+        impl Wake for DummyWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        static WAKER: Lazy<Arc<DummyWaker>> = Lazy::new(|| Arc::new(DummyWaker));
+
+        WAKER.clone().into()
+    }
+
+    type BoxFuture = Pin<Box<dyn Future<Output = Box<dyn Any>> + 'static>>;
+
+    pub struct TaskState {
+        state: Option<u32>,
+    }
+
+    impl TaskState {
+        pub fn state(&self) -> u32 {
+            self.state.unwrap()
+        }
+    }
+
+    pub type Task = Arc<Mutex<TaskState>>;
 
     pub struct IsyswasfaCtx;
 
     impl IsyswasfaCtx {
+        pub fn make_task(&mut self) -> Task {
+            Arc::new(Mutex::new(TaskState { state: None }))
+        }
+
         pub fn first_poll<T: 'static>(
             &mut self,
             future: impl Future<Output = wasmtime::Result<T>> + 'static,
-        ) -> wasmtime::Result<Result<T, Resource<Pending>>> {
+        ) -> wasmtime::Result<Result<T, Task>> {
+            let mut future = Box::pin(future.map(|v| Box::new(v) as Box<dyn Any>)) as BoxFuture;
+
+            Ok(
+                match future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&dummy_waker()))
+                {
+                    Poll::Pending => Err(self.make_task()),
+                    Poll::Ready(result) => Ok(*result.downcast().unwrap()),
+                },
+            )
+        }
+
+        pub fn get_ready<T: 'static>(&mut self, ready: Task) -> wasmtime::Result<T> {
             todo!()
         }
 
-        pub fn get_ready<T: 'static>(&mut self, ready: Resource<Ready>) -> wasmtime::Result<T> {
-            todo!()
-        }
-
-        pub async fn await_ready(&mut self, pending: Resource<Pending>) -> Resource<Ready> {
+        pub async fn await_ready(&mut self, pending: Task) -> Task {
             todo!()
         }
     }
@@ -155,6 +205,8 @@ mod isyswasfa_host {
     pub trait IsyswasfaView {
         type State: 'static;
 
+        fn table(&self) -> &Table;
+        fn table_mut(&mut self) -> &mut Table;
         fn isyswasfa(&self) -> &IsyswasfaCtx;
         fn isyswasfa_mut(&mut self) -> &mut IsyswasfaCtx;
         fn state(&self) -> Self::State;
@@ -174,12 +226,6 @@ async fn build_component(src_path: &str, name: &str) -> Result<Vec<u8>> {
         Err(anyhow!("cargo build failed"))
     }
 }
-
-pub struct MyPending;
-pub struct MyReady {
-    state: Option<u32>,
-}
-pub struct MyCancel;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -207,6 +253,12 @@ async fn main() -> Result<()> {
     impl IsyswasfaView for Ctx {
         type State = ();
 
+        fn table(&self) -> &Table {
+            &self.table
+        }
+        fn table_mut(&mut self) -> &mut Table {
+            &mut self.table
+        }
         fn isyswasfa(&self) -> &IsyswasfaCtx {
             &self.isyswasfa
         }
@@ -226,35 +278,37 @@ async fn main() -> Result<()> {
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::HostPending for Ctx {
-        fn drop(&mut self, this: Resource<MyPending>) -> wasmtime::Result<()> {
-            Ok(self.table_mut().delete(this).map(|_| ())?)
+        fn drop(&mut self, this: Resource<Pending>) -> wasmtime::Result<()> {
+            Ok(WasiView::table_mut(self).delete(this).map(|_| ())?)
         }
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::HostCancel for Ctx {
-        fn drop(&mut self, this: Resource<MyCancel>) -> wasmtime::Result<()> {
-            Ok(self.table_mut().delete(this).map(|_| ())?)
+        fn drop(&mut self, this: Resource<Cancel>) -> wasmtime::Result<()> {
+            Ok(WasiView::table_mut(self).delete(this).map(|_| ())?)
         }
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::HostReady for Ctx {
-        fn state(&mut self, this: Resource<MyReady>) -> wasmtime::Result<u32> {
-            Ok(self.table().get(&this)?.state.unwrap())
+        fn state(&mut self, this: Resource<Ready>) -> wasmtime::Result<u32> {
+            Ok(WasiView::table(self).get(&this)?.lock().unwrap().state())
         }
 
-        fn drop(&mut self, this: Resource<MyReady>) -> wasmtime::Result<()> {
-            Ok(self.table_mut().delete(this).map(|_| ())?)
+        fn drop(&mut self, this: Resource<Ready>) -> wasmtime::Result<()> {
+            Ok(WasiView::table_mut(self).delete(this).map(|_| ())?)
         }
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::Host for Ctx {
-        fn new(
+        fn make_task(
             &mut self,
         ) -> wasmtime::Result<(Resource<Pending>, Resource<Cancel>, Resource<Ready>)> {
+            let task = self.isyswasfa_mut().make_task();
+
             Ok((
-                self.table_mut().push(MyPending)?,
-                self.table_mut().push(MyCancel)?,
-                self.table_mut().push(MyReady { state: None })?,
+                WasiView::table_mut(self).push(task.clone())?,
+                WasiView::table_mut(self).push(task.clone())?,
+                WasiView::table_mut(self).push(task)?,
             ))
         }
     }
@@ -265,7 +319,7 @@ async fn main() -> Result<()> {
 
     let engine = Engine::new(&config)?;
 
-    let component = Component::new(&engine, &build_component("../guest", "guest").await?)?;
+    let component = Component::new(&engine, build_component("../guest", "guest").await?)?;
 
     let mut linker = Linker::new(&engine);
 
@@ -288,7 +342,7 @@ async fn main() -> Result<()> {
 
     let value = command
         .component_guest_original_interface_async()
-        .call_foo(&mut store, &"hello, world!")
+        .call_foo(&mut store, "hello, world!")
         .await?;
 
     println!("result is: {value}");

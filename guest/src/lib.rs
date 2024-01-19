@@ -144,7 +144,7 @@ mod isyswasfa_guest {
             .poll(&mut Context::from_waker(&dummy_waker()))
         {
             Poll::Pending => {
-                let (pending, cancel, ready) = isyswasfa::new();
+                let (pending, cancel, ready) = isyswasfa::make_task();
                 let future_state = Rc::new(RefCell::new(FutureState::Pending {
                     ready: Some(ready),
                     future,
