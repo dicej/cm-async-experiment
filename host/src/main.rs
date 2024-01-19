@@ -88,10 +88,13 @@ mod isyswasfa_bindings {
         pub mod component {
             pub mod guest {
                 pub mod original_interface_async {
-                    use super::super::super::super::super::exports::component::guest::original_interface_async::OriginalInterfaceAsync as OriginalInterfaceAsyncSync;
+                    use super::super::super::super::super::{
+                        exports::component::guest::original_interface_async::OriginalInterfaceAsync as Interface,
+                        isyswasfa_host::IsyswasfaView,
+                    };
 
                     #[derive(Copy, Clone)]
-                    pub struct OriginalInterfaceAsync<'a>(pub &'a OriginalInterfaceAsyncSync);
+                    pub struct OriginalInterfaceAsync<'a>(pub &'a Interface);
 
                     impl<'a> OriginalInterfaceAsync<'a> {
                         pub async fn call_foo<S: wasmtime::AsContextMut>(
@@ -100,9 +103,21 @@ mod isyswasfa_bindings {
                             arg0: &str,
                         ) -> wasmtime::Result<String>
                         where
-                            <S as wasmtime::AsContext>::Data: Send,
+                            <S as wasmtime::AsContext>::Data: IsyswasfaView + Send,
                         {
-                            todo!()
+                            match self.0.call_foo(&mut store, arg0).await? {
+                                Ok(result) => Ok(result),
+                                Err(pending) => {
+                                    let ready = store
+                                        .as_context_mut()
+                                        .data_mut()
+                                        .isyswasfa_mut()
+                                        .await_ready(pending)
+                                        .await;
+
+                                    self.0.call_foo_result(store, ready).await
+                                }
+                            }
                         }
                     }
                 }
@@ -131,6 +146,10 @@ mod isyswasfa_host {
         pub fn get_ready<T: 'static>(&mut self, ready: Resource<Ready>) -> wasmtime::Result<T> {
             todo!()
         }
+
+        pub async fn await_ready(&mut self, pending: Resource<Pending>) -> Resource<Ready> {
+            todo!()
+        }
     }
 
     pub trait IsyswasfaView {
@@ -157,7 +176,9 @@ async fn build_component(src_path: &str, name: &str) -> Result<Vec<u8>> {
 }
 
 pub struct MyPending;
-pub struct MyReady;
+pub struct MyReady {
+    state: Option<u32>,
+}
 pub struct MyCancel;
 
 #[tokio::main]
@@ -198,6 +219,7 @@ async fn main() -> Result<()> {
     #[async_trait]
     impl isyswasfa_bindings::component::guest::original_interface_async::Host for Ctx {
         async fn foo(_state: (), s: String) -> wasmtime::Result<String> {
+            // todo: make this await a `oneshot::Receiver` instead
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(format!("{s} - entered host - exited host"))
         }
@@ -205,23 +227,23 @@ async fn main() -> Result<()> {
 
     impl isyswasfa::isyswasfa::isyswasfa::HostPending for Ctx {
         fn drop(&mut self, this: Resource<MyPending>) -> wasmtime::Result<()> {
-            todo!()
+            Ok(self.table_mut().delete(this).map(|_| ())?)
         }
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::HostCancel for Ctx {
         fn drop(&mut self, this: Resource<MyCancel>) -> wasmtime::Result<()> {
-            todo!()
+            Ok(self.table_mut().delete(this).map(|_| ())?)
         }
     }
 
     impl isyswasfa::isyswasfa::isyswasfa::HostReady for Ctx {
         fn state(&mut self, this: Resource<MyReady>) -> wasmtime::Result<u32> {
-            todo!()
+            Ok(self.table().get(&this)?.state.unwrap())
         }
 
         fn drop(&mut self, this: Resource<MyReady>) -> wasmtime::Result<()> {
-            todo!()
+            Ok(self.table_mut().delete(this).map(|_| ())?)
         }
     }
 
@@ -229,7 +251,11 @@ async fn main() -> Result<()> {
         fn new(
             &mut self,
         ) -> wasmtime::Result<(Resource<Pending>, Resource<Cancel>, Resource<Ready>)> {
-            todo!()
+            Ok((
+                self.table_mut().push(MyPending)?,
+                self.table_mut().push(MyCancel)?,
+                self.table_mut().push(MyReady { state: None })?,
+            ))
         }
     }
 
