@@ -308,14 +308,16 @@ mod isyswasfa_guest {
 }
 
 // generated
-mod original_interface_async_async {
-    use super::{bindings::component::guest::original_interface_async, isyswasfa_guest};
+mod isyswasfa_bindings {
+    pub mod original_interface_async {
+        use super::super::{bindings::component::guest::original_interface_async, isyswasfa_guest};
 
-    pub async fn foo(s: &str) -> String {
-        match original_interface_async::foo(s) {
-            Ok(result) => result,
-            Err(pending) => {
-                original_interface_async::foo_result(isyswasfa_guest::await_ready(pending).await)
+        pub async fn foo(s: &str) -> String {
+            match original_interface_async::foo(s) {
+                Ok(result) => result,
+                Err(pending) => original_interface_async::foo_result(
+                    isyswasfa_guest::await_ready(pending).await,
+                ),
             }
         }
     }
@@ -355,6 +357,9 @@ struct ComponentAsync;
 #[async_trait(?Send)]
 impl GuestAsync for ComponentAsync {
     async fn foo(s: String) -> String {
-        original_interface_async_async::foo(&s).await
+        format!(
+            "{} - exit guest",
+            isyswasfa_bindings::original_interface_async::foo(&format!("{s} - enter guest")).await
+        )
     }
 }
