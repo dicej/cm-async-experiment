@@ -63,16 +63,16 @@ mod isyswasfa_bindings {
                 };
 
                 #[async_trait]
-                pub trait Host {
-                    async fn foo(&mut self, s: String) -> wasmtime::Result<String>;
+                pub trait Host: IsyswasfaView + Send + 'static {
+                    async fn foo(state: Self::State, s: String) -> wasmtime::Result<String>;
                 }
 
-                impl<T: Host + IsyswasfaView + Send> SyncHost for T {
+                impl<T: Host> SyncHost for T {
                     fn foo(
                         &mut self,
                         s: String,
                     ) -> wasmtime::Result<Result<String, Resource<Pending>>> {
-                        let future = <T as Host>::foo(&mut *self, s);
+                        let future = <T as Host>::foo(self.state(), s);
                         self.isyswasfa_mut().first_poll(future)
                     }
 
@@ -134,8 +134,11 @@ mod isyswasfa_host {
     }
 
     pub trait IsyswasfaView {
+        type State: 'static;
+
         fn isyswasfa(&self) -> &IsyswasfaCtx;
         fn isyswasfa_mut(&mut self) -> &mut IsyswasfaCtx;
+        fn state(&self) -> Self::State;
     }
 }
 
@@ -181,18 +184,21 @@ async fn main() -> Result<()> {
     }
 
     impl IsyswasfaView for Ctx {
+        type State = ();
+
         fn isyswasfa(&self) -> &IsyswasfaCtx {
             &self.isyswasfa
         }
         fn isyswasfa_mut(&mut self) -> &mut IsyswasfaCtx {
             &mut self.isyswasfa
         }
+        fn state(&self) -> Self::State {}
     }
 
     #[async_trait]
     impl isyswasfa_bindings::component::guest::original_interface_async::Host for Ctx {
-        async fn foo(&mut self, s: String) -> wasmtime::Result<String> {
-            tokio::time::sleep(Duration::from_secs(1));
+        async fn foo(_state: (), s: String) -> wasmtime::Result<String> {
+            tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(format!("{s} - entered host - exited host"))
         }
     }
