@@ -146,7 +146,7 @@ mod isyswasfa_host {
         WAKER.clone().into()
     }
 
-    type BoxFuture = Pin<Box<dyn Future<Output = (u32, Box<dyn Any>)> + Send + 'static>>;
+    type BoxFuture = Pin<Box<dyn Future<Output = Option<(u32, Box<dyn Any>)>> + Send + 'static>>;
 
     pub struct Task {
         reference_count: u32,
@@ -154,14 +154,15 @@ mod isyswasfa_host {
     }
 
     pub enum TaskState {
-        HostPending { future: BoxFuture },
+        HostPending(Option<oneshot::Sender<()>>),
+        HostReady(Option<Box<dyn Any>>),
         GuestPending,
-        GuestReady { guest_state: u32 },
+        GuestReady(u32),
     }
 
     pub struct IsyswasfaCtx {
         table: ResourceTable,
-        futures: FuturesUnordered<BoxFuture>,
+        futures: ReadyChunks<FuturesUnordered<Select<oneshot::Receiver<()>, BoxFuture>>>,
     }
 
     impl Default for IsyswasfaCtx {
@@ -198,9 +199,10 @@ mod isyswasfa_host {
             &mut self,
             future: impl Future<Output = wasmtime::Result<T>> + Send + 'static,
         ) -> wasmtime::Result<Result<T, Resource<Task>>> {
+            let (tx, rx) = oneshot::channel();
             let task = self.table.push(Task {
                 reference_count: 1,
-                state: TaskState::HostPending,
+                state: TaskState::HostPending(tx),
             })?;
             let rep = task.rep();
             let mut future =
@@ -216,7 +218,7 @@ mod isyswasfa_host {
                         Ok(*result.downcast().unwrap())
                     }
                     Poll::Pending => {
-                        self.futures.push(future);
+                        self.futures.get_mut().push(future::select(rx, future));
                         Err(task)
                     }
                 },
@@ -276,6 +278,7 @@ mod isyswasfa_host {
             let mut result = None;
             let input = HashMap::new();
             loop {
+                // todo: in all but the first loop, only call poll functions we have non-empty input for
                 for poll in polls {
                     let output = poll
                         .call_async(
@@ -313,12 +316,13 @@ mod isyswasfa_host {
                                 task.listen = Some(Listen { state, poll });
 
                                 match task.state {
-                                    TaskState::HostPending => input.entry(poll).or_default().push(
-                                        PollInput::Listening(PollInputListening {
+                                    TaskState::HostPending(_) => input
+                                        .entry(poll)
+                                        .or_default()
+                                        .push(PollInput::Listening(PollInputListening {
                                             state: state,
                                             cancel: pending,
-                                        }),
-                                    ),
+                                        })),
                                     TaskState::HostReady(_) => input.entry(poll).or_default().push(
                                         PollInput::Ready(PollInputReady {
                                             state: state,
@@ -377,8 +381,8 @@ mod isyswasfa_host {
                                 };
 
                                 match task.state {
-                                    TaskState::HostPending => {
-                                        todo!("how do we remove the correct entry from FuturesUnordered?");
+                                    TaskState::HostPending(cancel_tx) => {
+                                        cancel_tx.take().send(());
                                         cancel_host_task(&mut store, cancel);
                                     }
                                     TaskState::HostReady(_) => {
@@ -398,7 +402,7 @@ mod isyswasfa_host {
                                 }
                             }
                             PollOutput::CancelComplete(cancel) => {
-                                let listen = guest_pending(&mut store).listen.unwrap();
+                                let listen = task(&mut store).listen.unwrap();
 
                                 input
                                     .entry(listen.poll)
@@ -414,11 +418,29 @@ mod isyswasfa_host {
                         drop(&mut store, pending);
 
                         break Ok(ready);
-                    } else {
-                        let (task, result) = isyswasfa(&store).futures.next().await;
+                    } else if let Some(values) = isyswasfa(&store).futures.next().await {
+                        for value in values {
+                            match value {
+                                Either::Left(()) => {}
+                                Either::Right((task, result)) => {
+                                    let ready = Resource::new_owned(task);
+                                    let task = task(&mut store, &ready);
+                                    task.reference_count += 1;
+                                    task.state = TaskState::HostReady(result);
 
-                        *state(&mut store, Resource::new_owned(task)) =
-                            TaskState::HostReady(result);
+                                    if let Some(listen) = task.listen {
+                                        input.entry(listen.poll).or_default().push(
+                                            PollInput::Ready(PollInputReady {
+                                                state: listen.state,
+                                                ready,
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        bail!("guest task is pending with no pending host tasks");
                     }
                 }
             }
