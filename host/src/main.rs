@@ -106,10 +106,8 @@ mod isyswasfa_bindings {
                             match self.0.call_foo(&mut store, arg0).await? {
                                 Ok(result) => Ok(result),
                                 Err(pending) => {
-                                    let mut context = store.as_context_mut();
-                                    let data = context.data_mut();
-                                    let ready = data.isyswasfa().await_ready(pending).await;
-
+                                    let ready =
+                                        IsyswasfaView::await_ready(&mut store, pending).await;
                                     self.0.call_foo_result(store, ready).await
                                 }
                             }
@@ -123,7 +121,7 @@ mod isyswasfa_bindings {
 
 mod isyswasfa_host {
     use {
-        anyhow::anyhow,
+        anyhow::{anyhow, bail},
         futures::future::FutureExt,
         once_cell::sync::Lazy,
         std::{
@@ -148,7 +146,7 @@ mod isyswasfa_host {
         WAKER.clone().into()
     }
 
-    type BoxFuture = Pin<Box<dyn Future<Output = Box<dyn Any>> + Send + 'static>>;
+    type BoxFuture = Pin<Box<dyn Future<Output = (u32, Box<dyn Any>)> + Send + 'static>>;
 
     pub struct Task {
         reference_count: u32,
@@ -163,6 +161,7 @@ mod isyswasfa_host {
 
     pub struct IsyswasfaCtx {
         table: ResourceTable,
+        futures: FuturesUnordered<BoxFuture>,
     }
 
     impl Default for IsyswasfaCtx {
@@ -199,18 +198,27 @@ mod isyswasfa_host {
             &mut self,
             future: impl Future<Output = wasmtime::Result<T>> + Send + 'static,
         ) -> wasmtime::Result<Result<T, Resource<Task>>> {
-            let mut future = Box::pin(future.map(|v| Box::new(v) as Box<dyn Any>)) as BoxFuture;
+            let task = self.table.push(Task {
+                reference_count: 1,
+                state: TaskState::HostPending,
+            })?;
+            let rep = task.rep();
+            let mut future =
+                Box::pin(future.map(move |v| (rep, Box::new(v) as Box<dyn Any>))) as BoxFuture;
 
             Ok(
                 match future
                     .as_mut()
                     .poll(&mut Context::from_waker(&dummy_waker()))
                 {
-                    Poll::Ready(result) => Ok(*result.downcast().unwrap()),
-                    Poll::Pending => Err(self.table.push(Task {
-                        reference_count: 1,
-                        state: TaskState::HostPending { future },
-                    })?),
+                    Poll::Ready(result) => {
+                        self.drop(task);
+                        Ok(*result.downcast().unwrap())
+                    }
+                    Poll::Pending => {
+                        self.futures.push(future);
+                        Err(task)
+                    }
                 },
             )
         }
@@ -226,18 +234,194 @@ mod isyswasfa_host {
             let task = self.table.get_mut(&handle)?;
             task.reference_count = task.reference_count.checked_sub(1).unwrap();
             if task.reference_count == 0 {
+                self.host_tasks.remove(handle.rep());
                 self.table.delete(handle)?;
             }
             Ok(())
         }
 
         pub fn get_ready<T: 'static>(&mut self, ready: Resource<Task>) -> wasmtime::Result<T> {
-            todo!()
+            let value = match &mut self.table.get_mut(&ready)?.state {
+                TaskState::HostReady(value) => *value.take().unwrap().downcast().unwrap(),
+                _ => bail!("unexpected task state"),
+            }?;
+
+            self.drop(ready);
+
+            Ok(value)
         }
 
-        pub async fn await_ready(&mut self, pending: Resource<Task>) -> Resource<Task> {
-            // todo: make sure we drop `pending` correctly
-            todo!()
+        pub async fn await_ready<S: wasmtime::AsContextMut>(
+            mut store: S,
+            pending: Resource<Task>,
+        ) -> wasmtime::Result<String>
+        where
+            <S as wasmtime::AsContext>::Data: IsyswasfaView + Send,
+        {
+            let state = |store| {
+                &mut store
+                    .as_context_mut()
+                    .data_mut()
+                    .table()
+                    .get_mut(ready)
+                    .state
+            };
+
+            let guest_pending = |store| state(store).guest_pending();
+
+            let isyswasfa = |store| store.as_context_mut().data_mut().isyswasfa();
+
+            let drop = |store, handle| isyswasfa(store).drop(handle);
+
+            let mut result = None;
+            let input = HashMap::new();
+            loop {
+                for poll in polls {
+                    let output = poll
+                        .call_async(
+                            store.as_context_mut(),
+                            (&input.remove(poll).unwrap_or_else(Vec::new),),
+                        )
+                        .await?
+                        .0;
+                    poll.post_return_async(store.as_context_mut()).await?;
+
+                    for output in output {
+                        match output {
+                            PollOutput::Ready(PollOutputReady { state, ready }) => {
+                                if read.rep() == pending.rep() {
+                                    *state(&mut store) =
+                                        TaskState::GuestReady { guest_state: state };
+
+                                    result = Some(ready);
+                                } else if let Some(listen) = guest_pending(&mut store).listen {
+                                    input.entry(listen.poll).or_default().push(PollInput::Ready(
+                                        PollInputReady {
+                                            state: listen.state,
+                                            ready,
+                                        },
+                                    ));
+                                } else {
+                                    guest_pending(&mut store).ready = Some(StatePair {
+                                        state,
+                                        handle: ready,
+                                    });
+                                }
+                            }
+                            PollOutput::Listen(PollOutputListen { state, pending }) => {
+                                let task = task(&mut store, pending);
+                                task.listen = Some(Listen { state, poll });
+
+                                match task.state {
+                                    TaskState::HostPending => input.entry(poll).or_default().push(
+                                        PollInput::Listening(PollInputListening {
+                                            state: state,
+                                            cancel: pending,
+                                        }),
+                                    ),
+                                    TaskState::HostReady(_) => input.entry(poll).or_default().push(
+                                        PollInput::Ready(PollInputReady {
+                                            state: state,
+                                            ready: pending,
+                                        }),
+                                    ),
+                                    TaskState::GuestPending {
+                                        pending: Some(_), ..
+                                    } => {
+                                        input.entry(poll).or_default().push(PollInput::Listening(
+                                            PollInputListening {
+                                                state: state,
+                                                cancel: pending,
+                                            },
+                                        ));
+                                    }
+                                    TaskState::GuestPending { .. } => {
+                                        drop(&mut store, pending);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                            PollOutput::Pending(PollOutputPending { state, cancel }) => {
+                                if cancel.rep() == pending.rep() {
+                                    drop(&mut store, cancel);
+                                } else {
+                                    guest_pending(&mut store, &cancel).on_cancel =
+                                        Some(OnCancel { state, poll });
+
+                                    if let Some(listen) = guest_pending(&mut store, &cancel).listen
+                                    {
+                                        input.entry(listen.poll).or_default().push(
+                                            PollInput::Listening(PollInputListening {
+                                                state: listen.state,
+                                                cancel,
+                                            }),
+                                        );
+                                    } else {
+                                        guest_pending(&mut store).pending = Some(StatePair {
+                                            state,
+                                            handle: cancel,
+                                        });
+                                    }
+                                }
+                            }
+                            PollOutput::Cancel(cancel) => {
+                                let task = task(&mut store, &cancel);
+                                let listen = task.listen.unwrap();
+
+                                let cancel_host_task = |store, cancel| {
+                                    drop(&mut store, cancel);
+                                    input
+                                        .entry(listen.poll)
+                                        .or_default()
+                                        .push(PollInput::CancelComplete(listen.state));
+                                };
+
+                                match task.state {
+                                    TaskState::HostPending => {
+                                        todo!("how do we remove the correct entry from FuturesUnordered?");
+                                        cancel_host_task(&mut store, cancel);
+                                    }
+                                    TaskState::HostReady(_) => {
+                                        cancel_host_task(&mut store, cancel);
+                                    }
+                                    TaskState::GuestPending { on_cancel, .. } => {
+                                        let on_cancel = on_cancel.unwrap();
+
+                                        input.entry(on_cancel.poll).or_default().push(
+                                            PollInput::Cancel(PollInputCancel {
+                                                state: listen.state,
+                                                cancel,
+                                            }),
+                                        );
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                            PollOutput::CancelComplete(cancel) => {
+                                let listen = guest_pending(&mut store).listen.unwrap();
+
+                                input
+                                    .entry(listen.poll)
+                                    .or_default()
+                                    .push(PollInput::CancelComplete(listen.state));
+                            }
+                        }
+                    }
+                }
+
+                if input.is_empty() {
+                    if let Some(ready) = result.take() {
+                        drop(&mut store, pending);
+
+                        break Ok(ready);
+                    } else {
+                        let (task, result) = isyswasfa(&store).futures.next().await;
+
+                        *state(&mut store, Resource::new_owned(task)) =
+                            TaskState::HostReady(result);
+                    }
+                }
+            }
         }
     }
 
