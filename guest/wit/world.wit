@@ -9,12 +9,6 @@ package component:guest;
 //   export original-interface;
 // }
 
-interface isyswasfa {
-  use isyswasfa:isyswasfa/isyswasfa.{poll-input, poll-output};
-
-  poll-abc123: func(input: list<poll-input>) -> list<poll-output>;
-}
-
 interface original-interface-async {
   use isyswasfa:isyswasfa/isyswasfa.{pending, ready};
 
@@ -23,7 +17,10 @@ interface original-interface-async {
 }
 
 world original-world-async {
+  use isyswasfa:isyswasfa/isyswasfa.{poll-input, poll-output};
+
   import original-interface-async;
   export original-interface-async;
-  export isyswasfa;
+  
+  export isyswasfa-poll-abc123: func(input: list<poll-input>) -> list<poll-output>;
 }

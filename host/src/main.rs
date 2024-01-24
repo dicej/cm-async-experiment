@@ -140,8 +140,9 @@ mod isyswasfa_host {
             sync::Arc,
             task::{Context, Poll, Wake, Waker},
         },
+        wasmparser::{ComponentExternalKind, Parser, Payload},
         wasmtime::{
-            component::{Resource, ResourceTable, TypedFunc},
+            component::{Instance, Resource, ResourceTable, TypedFunc},
             StoreContextMut,
         },
     };
@@ -319,6 +320,47 @@ mod isyswasfa_host {
         handle: Resource<Task>,
     ) -> wasmtime::Result<()> {
         isyswasfa(store).drop(handle)
+    }
+
+    pub fn load_poll_funcs<S: wasmtime::AsContextMut>(
+        mut store: S,
+        component: &[u8],
+        instance: &Instance,
+    ) -> wasmtime::Result<()>
+    where
+        <S as wasmtime::AsContext>::Data: IsyswasfaView + Send,
+    {
+        let mut names = Vec::new();
+        for payload in Parser::new(0).parse_all(component) {
+            if let Payload::ComponentExportSection(reader) = payload? {
+                for export in reader {
+                    let export = export?;
+                    if let ComponentExternalKind::Func = export.kind {
+                        if export.name.0.starts_with("isyswasfa-poll") {
+                            names.push(export.name.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if names.is_empty() {
+            bail!("unable to find any function exports with names starting with `isyswasfa-poll`");
+        }
+
+        let polls = {
+            let mut store = store.as_context_mut();
+            let mut exports = instance.exports(&mut store);
+            let mut exports = exports.root();
+            names
+                .into_iter()
+                .map(|name| exports.typed_func::<(Vec<PollInput>,), (Vec<PollOutput>,)>(name))
+                .collect::<wasmtime::Result<_>>()?
+        };
+
+        store.as_context_mut().data_mut().isyswasfa().polls = polls;
+
+        Ok(())
     }
 
     pub async fn await_ready<S: wasmtime::AsContextMut>(
@@ -607,7 +649,9 @@ async fn main() -> Result<()> {
 
     let engine = Engine::new(&config)?;
 
-    let component = Component::new(&engine, build_component("../guest", "guest").await?)?;
+    let component_bytes = build_component("../guest", "guest").await?;
+
+    let component = Component::new(&engine, &component_bytes)?;
 
     let mut linker = Linker::new(&engine);
 
@@ -623,9 +667,11 @@ async fn main() -> Result<()> {
         },
     );
 
-    let (command, _) =
+    let (command, instance) =
         isyswasfa_bindings::OriginalWorldAsync::instantiate_async(&mut store, &component, &linker)
             .await?;
+
+    isyswasfa_host::load_poll_funcs(&mut store, &component_bytes, &instance)?;
 
     let value = command
         .component_guest_original_interface_async()

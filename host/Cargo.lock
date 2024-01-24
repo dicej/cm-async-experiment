@@ -712,6 +712,7 @@ dependencies = [
  "futures",
  "once_cell",
  "tokio",
+ "wasmparser",
  "wasmtime",
  "wasmtime-wasi",
 ]
