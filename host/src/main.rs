@@ -1,11 +1,11 @@
 use {
     anyhow::{anyhow, Result},
     async_trait::async_trait,
-    isyswasfa_host::{IsyswasfaCtx, IsyswasfaView, Task},
+    isyswasfa_host::{IsyswasfaCtx, IsyswasfaView},
     std::time::Duration,
     tokio::{fs, process::Command},
     wasmtime::{
-        component::{Component, Linker, Resource, ResourceTable},
+        component::{Component, Linker, ResourceTable},
         Config, Engine, Store,
     },
     wasmtime_wasi::preview2::{command, WasiCtx, WasiCtxBuilder, WasiView},
@@ -122,8 +122,9 @@ mod isyswasfa_bindings {
 mod isyswasfa_host {
     use {
         super::isyswasfa::isyswasfa::isyswasfa::{
-            PollInput, PollInputCancel, PollInputListening, PollInputReady, PollOutput,
-            PollOutputListen, PollOutputPending, PollOutputReady,
+            Host, HostCancel, HostPending, HostReady, PollInput, PollInputCancel,
+            PollInputListening, PollInputReady, PollOutput, PollOutputListen, PollOutputPending,
+            PollOutputReady,
         },
         anyhow::{anyhow, bail},
         futures::{
@@ -211,7 +212,7 @@ mod isyswasfa_host {
             &mut self.table
         }
 
-        pub fn guest_pending(
+        fn guest_pending(
             &mut self,
         ) -> wasmtime::Result<(Resource<Task>, Resource<Task>, Resource<Task>)> {
             let pending = self.table.push(Task {
@@ -257,14 +258,14 @@ mod isyswasfa_host {
             )
         }
 
-        pub fn guest_state(&self, ready: Resource<Task>) -> wasmtime::Result<u32> {
+        fn guest_state(&self, ready: Resource<Task>) -> wasmtime::Result<u32> {
             match &self.table.get(&ready)?.state {
                 TaskState::GuestReady(guest_state) => Ok(*guest_state),
                 _ => Err(anyhow!("unexpected task state")),
             }
         }
 
-        pub fn drop(&mut self, handle: Resource<Task>) -> wasmtime::Result<()> {
+        fn drop(&mut self, handle: Resource<Task>) -> wasmtime::Result<()> {
             let task = self.table.get_mut(&handle)?;
             task.reference_count = task.reference_count.checked_sub(1).unwrap();
             if task.reference_count == 0 {
@@ -289,7 +290,7 @@ mod isyswasfa_host {
         store: &'a mut StoreContextMut<'a, T>,
         handle: &Resource<Task>,
     ) -> wasmtime::Result<&'a mut Task> {
-        Ok(store.data_mut().table().get_mut(handle)?)
+        Ok(store.data_mut().isyswasfa().table().get_mut(handle)?)
     }
 
     fn state<'a, T: IsyswasfaView + Send>(
@@ -556,9 +557,38 @@ mod isyswasfa_host {
     pub trait IsyswasfaView {
         type State: 'static;
 
-        fn table(&mut self) -> &mut ResourceTable;
         fn isyswasfa(&mut self) -> &mut IsyswasfaCtx;
         fn state(&self) -> Self::State;
+    }
+
+    impl<T: IsyswasfaView> HostPending for T {
+        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
+            self.isyswasfa().drop(this)
+        }
+    }
+
+    impl<T: IsyswasfaView> HostCancel for T {
+        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
+            self.isyswasfa().drop(this)
+        }
+    }
+
+    impl<T: IsyswasfaView> HostReady for T {
+        fn state(&mut self, this: Resource<Task>) -> wasmtime::Result<u32> {
+            self.isyswasfa().guest_state(this)
+        }
+
+        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
+            self.isyswasfa().drop(this)
+        }
+    }
+
+    impl<T: IsyswasfaView> Host for T {
+        fn make_task(
+            &mut self,
+        ) -> wasmtime::Result<(Resource<Task>, Resource<Task>, Resource<Task>)> {
+            self.isyswasfa().guest_pending()
+        }
     }
 }
 
@@ -595,9 +625,6 @@ async fn main() -> Result<()> {
     impl IsyswasfaView for Ctx {
         type State = ();
 
-        fn table(&mut self) -> &mut ResourceTable {
-            self.isyswasfa.table()
-        }
         fn isyswasfa(&mut self) -> &mut IsyswasfaCtx {
             &mut self.isyswasfa
         }
@@ -607,39 +634,8 @@ async fn main() -> Result<()> {
     #[async_trait]
     impl isyswasfa_bindings::component::guest::original_interface_async::Host for Ctx {
         async fn foo(_state: (), s: String) -> wasmtime::Result<String> {
-            // todo: make this await a `oneshot::Receiver` instead
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(format!("{s} - entered host - exited host"))
-        }
-    }
-
-    impl isyswasfa::isyswasfa::isyswasfa::HostPending for Ctx {
-        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
-            self.isyswasfa().drop(this)
-        }
-    }
-
-    impl isyswasfa::isyswasfa::isyswasfa::HostCancel for Ctx {
-        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
-            self.isyswasfa().drop(this)
-        }
-    }
-
-    impl isyswasfa::isyswasfa::isyswasfa::HostReady for Ctx {
-        fn state(&mut self, this: Resource<Task>) -> wasmtime::Result<u32> {
-            self.isyswasfa().guest_state(this)
-        }
-
-        fn drop(&mut self, this: Resource<Task>) -> wasmtime::Result<()> {
-            self.isyswasfa().drop(this)
-        }
-    }
-
-    impl isyswasfa::isyswasfa::isyswasfa::Host for Ctx {
-        fn make_task(
-            &mut self,
-        ) -> wasmtime::Result<(Resource<Task>, Resource<Task>, Resource<Task>)> {
-            self.isyswasfa().guest_pending()
         }
     }
 
