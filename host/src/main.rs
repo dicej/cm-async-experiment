@@ -247,7 +247,7 @@ mod isyswasfa_host {
                 {
                     Poll::Ready((_, result)) => {
                         self.drop(task)?;
-                        Ok(*result.downcast().unwrap())
+                        Ok((*result.downcast::<wasmtime::Result<T>>().unwrap())?)
                     }
                     Poll::Pending => {
                         self.futures.get_mut().push(future::select(rx, future));
@@ -281,7 +281,7 @@ mod isyswasfa_host {
 
             self.drop(ready)?;
 
-            Ok(value)
+            value
         }
     }
 
@@ -570,7 +570,7 @@ async fn build_component(src_path: &str, name: &str) -> Result<Vec<u8>> {
         .await?
         .success()
     {
-        Ok(fs::read(format!("../target/wasm32-wasi/debug/{name}.wasm")).await?)
+        Ok(fs::read(format!("{src_path}/target/wasm32-wasi/debug/{name}.wasm")).await?)
     } else {
         Err(anyhow!("cargo build failed"))
     }

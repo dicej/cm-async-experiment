@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 
 [package.metadata.component]
 package = "component:guest"
+adapter = "adapters/b110e57e/wasi_snapshot_preview1.reactor.wasm"
 
 [package.metadata.component.target.dependencies]
 "isyswasfa:isyswasfa" = { path = "wit/deps/isyswasfa" }

@@ -1,15 +1,16 @@
-#![allow(clippy::module_inception)]
-
-cargo_component_bindings::generate!();
+#[allow(clippy::all)]
+mod bindings {
+    use super::Component;
+    pub use bindings::*;
+    cargo_component_bindings::generate!();
+}
 
 use {
     async_trait::async_trait,
     bindings::{
-        exports::component::guest::{
-            isyswasfa::Guest as Isyswasfa,
-            original_interface_async::Guest as OriginalInterfaceAsync,
-        },
+        exports::component::guest::original_interface_async::Guest as OriginalInterfaceAsync,
         isyswasfa::isyswasfa::isyswasfa::{Pending, PollInput, PollOutput, Ready},
+        Guest,
     },
 };
 
@@ -115,7 +116,7 @@ mod isyswasfa_guest {
     impl Drop for FutureState {
         fn drop(&mut self) {
             match self {
-                Self::Pending { .. } => unreachable!(),
+                Self::Pending { .. } => (),
                 Self::Cancelled(cancel) => push(PollOutput::CancelComplete(cancel.take().unwrap())),
                 Self::Ready(ready) => assert!(ready.is_none()),
             }
@@ -269,7 +270,7 @@ mod isyswasfa_guest {
 
                     let mut old = mem::replace(
                         future_state.borrow_mut().deref_mut(),
-                        FutureState::Ready(Some(Box::new(result))),
+                        FutureState::Ready(Some(result)),
                     );
 
                     let FutureState::Pending {
@@ -327,8 +328,8 @@ mod isyswasfa_bindings {
 struct Component;
 
 // generated
-impl Isyswasfa for Component {
-    fn poll_abc123(input: Vec<PollInput>) -> Vec<PollOutput> {
+impl Guest for Component {
+    fn isyswasfa_poll_abc123(input: Vec<PollInput>) -> Vec<PollOutput> {
         isyswasfa_guest::poll(input)
     }
 }
@@ -358,8 +359,9 @@ struct ComponentAsync;
 impl GuestAsync for ComponentAsync {
     async fn foo(s: String) -> String {
         format!(
-            "{} - exit guest",
-            isyswasfa_bindings::original_interface_async::foo(&format!("{s} - enter guest")).await
+            "{} - exited guest",
+            isyswasfa_bindings::original_interface_async::foo(&format!("{s} - entered guest"))
+                .await
         )
     }
 }

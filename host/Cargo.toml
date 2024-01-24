@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.79"
+anyhow = { version = "1.0.79", features = ["backtrace"] }
 async-trait = "0.1.77"
 futures = "0.3.30"
 once_cell = "1.19.0"
